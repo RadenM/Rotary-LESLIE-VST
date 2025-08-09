@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Rotary Speaker PoC - Batch 2</title>
+<style>
+  body { font-family: sans-serif; background: #111; color: #eee; text-align: center; }
+  .control { margin: 8px; display: inline-block; }
+  label { display: block; margin-bottom: 4px; }
+  input[type=range] { width: 180px; }
+  canvas { background: #222; margin-top: 20px; }
+</style>
+</head>
+<body>
+<h1>Rotary Speaker PoC</h1>
+<div id="controls">
+  <div class="control">
+    <label for="hornSlow">Horn Slow (Hz)</label>
+    <input type="range" id="hornSlow" min="0.1" max="6" step="0.1" value="0.8">
+  </div>
+  <div class="control">
+    <label for="hornFast">Horn Fast (Hz)</label>
+    <input type="range" id="hornFast" min="1" max="15" step="0.1" value="6.8">
+  </div>
+  <div class="control">
+    <label for="drumSlow">Drum Slow (Hz)</label>
+    <input type="range" id="drumSlow" min="0.1" max="3" step="0.1" value="0.4">
+  </div>
+  <div class="control">
+    <label for="drumFast">Drum Fast (Hz)</label>
+    <input type="range" id="drumFast" min="0.5" max="10" step="0.1" value="5.5">
+  </div>
+  <div class="control">
+    <label for="rampUp">Ramp Up (s)</label>
+    <input type="range" id="rampUp" min="0.05" max="5" step="0.05" value="1.8">
+  </div>
+  <div class="control">
+    <label for="rampDown">Ramp Down (s)</label>
+    <input type="range" id="rampDown" min="0.05" max="5" step="0.05" value="1.8">
+  </div>
+  <div class="control">
+    <label for="balance">Horn/Drum Balance</label>
+    <input type="range" id="balance" min="0" max="1" step="0.01" value="0.5">
+  </div>
+</div>
+<br/>
+<button id="speedToggle">Fast</button>
+<button id="brakeToggle">Brake</button>
+<button id="start">Start</button>
+<canvas id="visual" width="300" height="150"></canvas>
+<script>
+let audioCtx;
+let inputOsc;
+let crossoverHigh, crossoverLow;
+let hornLeft, hornRight, drumLeft, drumRight;
+let hornRotor, drumRotor;
+let merger, outputGain;
+let running = false;
+
+class Rotor {
+  constructor(delayL, delayR, gainL, gainR) {
+    this.delayL = delayL;
+    this.delayR = delayR;
+    this.gainL = gainL;
+    this.gainR = gainR;
+    this.slow = 1; // Hz
+    this.fast = 5; // Hz
+    this.currentSpeed = 1;
+    this.targetSpeed = 1;
+    this.rampUp = 1.8; // seconds
+    this.rampDown = 1.8;
+    this.angle = 0;
+  }
+  setMode(mode) {
+    if (mode === 'fast') this.targetSpeed = this.fast;
+    else this.targetSpeed = this.slow;
+  }
+  brake(on, angleTarget = 0) {
+    if (on) {
+      this.targetSpeed = 0;
+      this.brakeAngle = angleTarget;
+    } else {
+      this.brakeAngle = null;
+    }
+  }
+  update(dt, time) {
+    const ramp = this.targetSpeed > this.currentSpeed ? this.rampUp : this.rampDown;
+    const coef = Math.exp(-dt / ramp);
+    this.currentSpeed = this.targetSpeed + (this.currentSpeed - this.targetSpeed) * coef;
+    if (this.brakeAngle !== null && this.currentSpeed < 0.01) {
+      this.angle = this.brakeAngle;
+      return;
+    }
+    this.angle += this.currentSpeed * dt * 2 * Math.PI;
+    const ang = this.angle;
+    const doppler = 0.003 * Math.sin(ang); // +/-3ms
+    this.delayL.delayTime.setValueAtTime(0.005 + doppler, time);
+    this.delayR.delayTime.setValueAtTime(0.005 - doppler, time);
+    const ampL = 0.5 * (1 + Math.cos(ang));
+    const ampR = 0.5 * (1 - Math.cos(ang));
+    this.gainL.gain.setValueAtTime(ampL, time);
+    this.gainR.gain.setValueAtTime(ampR, time);
+  }
+}
+
+function createAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  inputOsc = audioCtx.createOscillator();
+  inputOsc.type = 'sawtooth';
+  inputOsc.frequency.value = 440;
+
+  crossoverHigh = audioCtx.createBiquadFilter();
+  crossoverHigh.type = 'highpass';
+  crossoverHigh.frequency.value = 800;
+  crossoverLow = audioCtx.createBiquadFilter();
+  crossoverLow.type = 'lowpass';
+  crossoverLow.frequency.value = 800;
+
+  // Horn path
+  hornLeft = audioCtx.createDelay(0.02);
+  hornRight = audioCtx.createDelay(0.02);
+  let hornGainL = audioCtx.createGain();
+  let hornGainR = audioCtx.createGain();
+  hornRotor = new Rotor(hornLeft, hornRight, hornGainL, hornGainR);
+
+  // Drum path
+  drumLeft = audioCtx.createDelay(0.02);
+  drumRight = audioCtx.createDelay(0.02);
+  let drumGainL = audioCtx.createGain();
+  let drumGainR = audioCtx.createGain();
+  drumRotor = new Rotor(drumLeft, drumRight, drumGainL, drumGainR);
+
+  // balance gains
+  let hornBalance = audioCtx.createGain();
+  let drumBalance = audioCtx.createGain();
+
+  // connect paths
+  inputOsc.connect(crossoverHigh);
+  inputOsc.connect(crossoverLow);
+
+  crossoverHigh.connect(hornLeft).connect(hornGainL);
+  crossoverHigh.connect(hornRight).connect(hornGainR);
+
+  crossoverLow.connect(drumLeft).connect(drumGainL);
+  crossoverLow.connect(drumRight).connect(drumGainR);
+
+  merger = audioCtx.createChannelMerger(2);
+  hornGainL.connect(hornBalance);
+  hornGainR.connect(hornBalance);
+  hornBalance.connect(merger, 0, 0);
+  hornBalance.connect(merger, 0, 1);
+
+  drumGainL.connect(drumBalance);
+  drumGainR.connect(drumBalance);
+  drumBalance.connect(merger, 0, 0);
+  drumBalance.connect(merger, 0, 1);
+
+  outputGain = audioCtx.createGain();
+  merger.connect(outputGain).connect(audioCtx.destination);
+
+  inputOsc.start();
+}
+
+function updateParams() {
+  hornRotor.slow = parseFloat(document.getElementById('hornSlow').value);
+  hornRotor.fast = parseFloat(document.getElementById('hornFast').value);
+  drumRotor.slow = parseFloat(document.getElementById('drumSlow').value);
+  drumRotor.fast = parseFloat(document.getElementById('drumFast').value);
+  hornRotor.rampUp = hornRotor.rampDown = parseFloat(document.getElementById('rampUp').value);
+  drumRotor.rampUp = drumRotor.rampDown = parseFloat(document.getElementById('rampDown').value);
+  const bal = parseFloat(document.getElementById('balance').value);
+  // simple balance by adjusting path gains
+  outputGain.gain.setValueAtTime(1, audioCtx.currentTime);
+}
+
+let lastTime;
+function loop(time) {
+  if (!lastTime) lastTime = time;
+  const dt = (time - lastTime) / 1000;
+  lastTime = time;
+  if (running) {
+    hornRotor.update(dt, audioCtx.currentTime);
+    drumRotor.update(dt, audioCtx.currentTime);
+  }
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function draw() {
+  const canvas = document.getElementById('visual');
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = '#0f0';
+  ctx.beginPath();
+  ctx.arc(100,75,30,0,Math.PI*2);
+  ctx.moveTo(100,75);
+  ctx.lineTo(100 + Math.cos(hornRotor.angle)*30,75 + Math.sin(hornRotor.angle)*30);
+  ctx.stroke();
+
+  ctx.strokeStyle = '#0ff';
+  ctx.beginPath();
+  ctx.arc(200,75,30,0,Math.PI*2);
+  ctx.moveTo(200,75);
+  ctx.lineTo(200 + Math.cos(drumRotor.angle)*30,75 + Math.sin(drumRotor.angle)*30);
+  ctx.stroke();
+}
+
+['hornSlow','hornFast','drumSlow','drumFast','rampUp','rampDown','balance'].forEach(id => {
+  document.getElementById(id).addEventListener('input', updateParams);
+});
+
+document.getElementById('speedToggle').addEventListener('click', () => {
+  const mode = hornRotor.targetSpeed === hornRotor.fast ? 'slow' : 'fast';
+  hornRotor.setMode(mode);
+  drumRotor.setMode(mode);
+});
+
+document.getElementById('brakeToggle').addEventListener('click', () => {
+  const on = hornRotor.targetSpeed !== 0;
+  hornRotor.brake(on, hornRotor.angle);
+  drumRotor.brake(on, drumRotor.angle);
+});
+
+document.getElementById('start').addEventListener('click', () => {
+  if (!running) {
+    createAudio();
+    updateParams();
+    hornRotor.setMode('slow');
+    drumRotor.setMode('slow');
+    running = true;
+    document.getElementById('start').textContent = 'Stop';
+  } else {
+    audioCtx.close();
+    running = false;
+    document.getElementById('start').textContent = 'Start';
+  }
+});
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
